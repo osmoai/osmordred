@@ -20,7 +20,7 @@ jobs:
           CIBW_BUILD: cp311-macosx_arm64
         shell: bash
         run: |
-          NO_CONDA=1 ./build_rdkit-pypi.sh
+          NO_CONDA=1 build_patched_rdkit-pypi/build_rdkit-pypi.sh
 
       - name: Save Wheels
         uses: actions/upload-artifact@v4
