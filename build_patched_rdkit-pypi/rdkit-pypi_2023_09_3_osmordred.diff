@@ -1,5 +1,5 @@
 diff --git a/pyproject.toml b/pyproject.toml
-index b4dedf4..160e982 100644
+index b4dedf4..4498b2d 100644
 --- a/pyproject.toml
 +++ b/pyproject.toml
 @@ -22,8 +22,9 @@ test-command = "pytest --exitfirst --verbose --failed-first {package}/tests"
@@ -14,10 +14,28 @@ index b4dedf4..160e982 100644
      # cairo-devel from the centos repo does not work, build here
      "wget https://www.cairographics.org/snapshots/cairo-1.15.14.tar.xz --no-check-certificate",
      "tar xvf cairo-*",
+@@ -49,7 +50,7 @@ before-all = [
+     rm /usr/local/lib/libfreetype.dylib
+     install_arm=( libpng libx11 libxau libxcb libxdmcp libxext libxrender fontconfig glib lzo pixman cairo freetype )
+     for i in "${install_arm[@]}"; do
+-        response=$(brew fetch --force --bottle-tag=arm64_monterey $i | grep Downloaded )
++        response=$(brew fetch --force --bottle-tag=arm64_ventura $i | grep Downloaded )
+         download_path=$(echo $response | xargs -n 1 | tail -1)
+         brew reinstall $download_path
+     done
 diff --git a/setup.py b/setup.py
-index e915938..d8e05e8 100644
+index e915938..e27895a 100644
 --- a/setup.py
 +++ b/setup.py
+@@ -36,7 +36,7 @@ class BuildRDKit(build_ext_orig):
+ 
+     def conan_install(self, conan_toolchain_path):
+         """Run the Conan"""
+-        boost_version = "1.78.0"
++        boost_version = "1.85.0"
+ 
+         # This modified conanfile.py for boost does not link libpython*.so
+         # When building a platform wheel, we don't want to link libpython*.so.
 @@ -168,6 +168,18 @@ class BuildRDKit(build_ext_orig):
              ["git", "clone", "-b", f"{ext.rdkit_tag}", "https://github.com/rdkit/rdkit"]
          )
