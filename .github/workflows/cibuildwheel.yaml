@@ -18,6 +18,7 @@ jobs:
         env:
           CIBW_PLATFORM: macos
           CIBW_BUILD: cp311-macosx_arm64
+          CIBW_ARCHS: all
         shell: bash
         run: |
           NO_CONDA=1 build_patched_rdkit-pypi/build_rdkit-pypi.sh
