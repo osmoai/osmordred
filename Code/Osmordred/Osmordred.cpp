@@ -51,6 +51,7 @@
 
 
 #include <boost/graph/adjacency_list.hpp>
+#include <boost/graph/biconnected_components.hpp>
 
 #include <set>
 #include <cmath> // For M_PI and pow
@@ -4404,6 +4405,13 @@ std::vector<double> calcPathCount(const RDKit::ROMol& mol) {
 
 
     std::vector<double> calcDetourMatrixDescs(const RDKit::ROMol& mol) {
+        // See calcDetourMatrixDescsL: guard the NP-hard longest-path detour matrix
+        // against exponential blow-up on highly-cyclic molecules.
+        const int circuitRank =
+            static_cast<int>(mol.getNumBonds()) - static_cast<int>(mol.getNumAtoms()) + 1;
+        if (circuitRank > 12) {
+            return std::vector<double>(14, std::numeric_limits<double>::quiet_NaN());
+        }
         Eigen::MatrixXd AdjMat = calculateAdjacencyMatrix( mol);
 
         int numAtoms = mol.getNumAtoms();
@@ -4519,11 +4527,160 @@ std::vector<std::vector<double>> calculateAdjacencyMatrixL(const RDKit::ROMol& m
     return adjMatrix;
 }
 
+
+// All-pairs longest simple path WITHIN one biconnected component (a single ring system,
+// hence small). Same naive backtracking DFS as longestSimplePathL, but confined to the BCC
+// so the exponential cost stays bounded. lsp is keyed by (min,max) global atom index.
+static void allPairsLongestPathBCC(
+    const std::vector<int> &nodes,
+    const std::unordered_map<int, std::vector<std::pair<int, double>>> &adj,
+    std::map<std::pair<int, int>, double> &lsp) {
+  std::unordered_set<int> visited;
+  std::function<void(int, double, std::unordered_map<int, double> &)> dfs =
+      [&](int u, double dist, std::unordered_map<int, double> &result) {
+        visited.insert(u);
+        auto rIt = result.find(u);
+        if (dist > rIt->second) rIt->second = dist;
+        auto aIt = adj.find(u);
+        if (aIt != adj.end())
+          for (const auto &vw : aIt->second)
+            if (visited.find(vw.first) == visited.end())
+              dfs(vw.first, dist + vw.second, result);
+        visited.erase(u);
+      };
+  for (int s : nodes) {
+    std::unordered_map<int, double> result;
+    for (int n : nodes) result[n] = 0.0;
+    visited.clear();
+    dfs(s, 0.0, result);
+    for (int g : nodes) {
+      auto key = std::make_pair(std::min(s, g), std::max(s, g));
+      double d = result[g];
+      auto f = lsp.find(key);
+      if (f == lsp.end() || d > f->second) lsp[key] = d;
+    }
+  }
+}
+
+// Detour matrix via biconnected-component decomposition + articulation-vertex merge, i.e.
+// the exact algorithm Mordred (CalcDetour) uses. The NP-hard longest-path work is confined
+// to each ring system (small); results are combined in polynomial time along the block-cut
+// tree (blocks share exactly one cut atom). Returns an EMPTY matrix if any single ring
+// system is too large to be tractable (circuit rank > 12; a fullerene-like cage, never in
+// real drug/natural-product chemistry), signalling the caller to emit NaN.
+static std::vector<std::vector<double>> computeDetourMatrixBCC(const RDKit::ROMol &mol) {
+  using namespace boost;
+  const int N = static_cast<int>(mol.getNumAtoms());
+  if (N == 0) return {};
+  if (N == 1) return {{0.0}};
+
+  typedef adjacency_list<vecS, vecS, undirectedS, no_property,
+                         property<edge_index_t, std::size_t>>
+      BGraph;
+  BGraph g(N);
+  std::size_t eidx = 0;
+  for (const auto &bond : mol.bonds()) {
+    add_edge(bond->getBeginAtomIdx(), bond->getEndAtomIdx(), eidx++, g);
+  }
+  if (num_edges(g) == 0) return std::vector<std::vector<double>>(N, std::vector<double>(N, 0.0));
+
+  std::vector<std::size_t> comp(num_edges(g));
+  auto compMap = make_iterator_property_map(comp.begin(), get(edge_index, g));
+  std::size_t nBcc = biconnected_components(g, compMap);
+
+  std::vector<std::vector<std::pair<int, int>>> bccEdges(nBcc);
+  graph_traits<BGraph>::edge_iterator ei, ei_end;
+  for (boost::tie(ei, ei_end) = edges(g); ei != ei_end; ++ei) {
+    bccEdges[compMap[*ei]].emplace_back(static_cast<int>(source(*ei, g)),
+                                        static_cast<int>(target(*ei, g)));
+  }
+
+  struct Block {
+    std::set<int> nodes;
+    std::map<std::pair<int, int>, double> lsp;
+  };
+  std::vector<Block> Q;
+  for (const auto &edgesInBcc : bccEdges) {
+    if (edgesInBcc.empty()) continue;
+    std::set<int> bnodes;
+    std::unordered_map<int, std::vector<std::pair<int, double>>> adj;
+    for (const auto &ab : edgesInBcc) {
+      bnodes.insert(ab.first);
+      bnodes.insert(ab.second);
+      adj[ab.first].emplace_back(ab.second, 1.0);
+      adj[ab.second].emplace_back(ab.first, 1.0);
+    }
+    const int rank =
+        static_cast<int>(edgesInBcc.size()) - static_cast<int>(bnodes.size()) + 1;
+    if (rank > 12) return {};  // intractable single ring system -> caller emits NaN
+    Block blk;
+    blk.nodes = bnodes;
+    std::vector<int> nodeVec(bnodes.begin(), bnodes.end());
+    allPairsLongestPathBCC(nodeVec, adj, blk.lsp);
+    Q.push_back(std::move(blk));
+  }
+  if (Q.empty()) return std::vector<std::vector<double>>(N, std::vector<double>(N, 0.0));
+
+  // Merge blocks along the block-cut tree (Mordred CalcDetour.merge / calc_weight).
+  std::set<int> nodes = Q.back().nodes;
+  std::map<std::pair<int, int>, double> C = Q.back().lsp;
+  Q.pop_back();
+  while (!Q.empty()) {
+    int found = -1, common = -1;
+    for (int i = static_cast<int>(Q.size()) - 1; i >= 0; --i) {
+      int inter = -1, nInter = 0;
+      for (int n : Q[i].nodes)
+        if (nodes.count(n)) { inter = n; if (++nInter > 1) break; }
+      if (nInter == 0) continue;
+      if (nInter > 1) return {};  // block-cut property violated (shouldn't happen)
+      found = i; common = inter; break;
+    }
+    if (found < 0) return {};  // disconnected (shouldn't happen for a valid molecule)
+    Block blk = std::move(Q[found]);
+    Q.erase(Q.begin() + found);
+    std::set<int> newNodes = nodes;
+    for (int n : blk.nodes) newNodes.insert(n);
+    const auto &lsp = blk.lsp;
+    std::map<std::pair<int, int>, double> newC;
+    for (int i : newNodes)
+      for (int j : newNodes) {
+        if (i > j) continue;
+        auto ij = std::make_pair(i, j);
+        auto cIt = C.find(ij);
+        if (cIt != C.end()) { newC[ij] = cIt->second; continue; }
+        auto lIt = lsp.find(ij);
+        if (lIt != lsp.end()) { newC[ij] = lIt->second; continue; }
+        auto ic = std::make_pair(std::min(i, common), std::max(i, common));
+        auto jc = std::make_pair(std::min(j, common), std::max(j, common));
+        auto cic = C.find(ic);
+        auto ljc = lsp.find(jc);
+        if (cic != C.end() && ljc != lsp.end()) { newC[ij] = cic->second + ljc->second; continue; }
+        auto cjc = C.find(jc);
+        auto lic = lsp.find(ic);
+        if (cjc != C.end() && lic != lsp.end()) { newC[ij] = cjc->second + lic->second; continue; }
+        return {};  // unexpected
+      }
+    C = std::move(newC);
+    nodes = std::move(newNodes);
+  }
+
+  std::vector<std::vector<double>> D(N, std::vector<double>(N, 0.0));
+  for (const auto &kv : C) {
+    D[kv.first.first][kv.first.second] = kv.second;
+    D[kv.first.second][kv.first.first] = kv.second;
+  }
+  return D;
+}
+
 std::vector<double> calcDetourMatrixDescsL(const RDKit::ROMol& mol) {
-    auto adjMatrix = calculateAdjacencyMatrixL(mol); // Convert adjacency matrix computation to LAPACK
     int numAtoms = mol.getNumAtoms();
 
-    auto detourMatrix = computeDetourMatrixL(numAtoms, adjMatrix);
+    // Detour matrix via Mordred-style biconnected decomposition (fast + exact); NaN only if
+    // a single ring system is genuinely intractable (returned as an empty matrix).
+    auto detourMatrix = computeDetourMatrixBCC(mol);
+    if (detourMatrix.empty()) {
+        return std::vector<double>(14, std::numeric_limits<double>::quiet_NaN());
+    }
 
     // Convert detourMatrix to 1D array in column-major order for LAPACK
     std::vector<double> flatMatrix(numAtoms * numAtoms);
@@ -8733,7 +8890,11 @@ void solveLinearSystem(const RDKit::ROMol &mol ,std::vector<double>& A, std::vec
 
     success = false; // Initialize success flag
 
-    // First, try dposv
+    // CRITICAL FIX v2.0: Save original RHS before any LAPACK call modifies B.
+    // LAPACK routines modify B in-place, even when they fail!
+    std::vector<double> B_original = B;
+
+    // First, try dposv (Cholesky factorization for positive definite matrices)
     std::vector<double> A_copy = A; // Copy A because LAPACK modifies it
     info = LAPACKE_dposv(LAPACK_COL_MAJOR, 'U', n, nrhs, A_copy.data(), lda, B.data(), ldb);
 
@@ -8741,20 +8902,48 @@ void solveLinearSystem(const RDKit::ROMol &mol ,std::vector<double>& A, std::vec
         success = true;
         return;
     } else {
-        // dposv failed; fall back to dgesv
+        // dposv failed; fall back to dgesv (LU factorization)
+        // CRITICAL FIX v2.0: Restore original RHS before calling dgesv --
+        // dposv modified B even though it failed, so v1 retried on a corrupted RHS.
+        B = B_original;
+
         std::vector<int> ipiv(n); // Pivot array for dgesv
         A_copy = A; // Reset A because it was modified by dposv
         info = LAPACKE_dgesv(LAPACK_COL_MAJOR, n, nrhs, A_copy.data(), lda, ipiv.data(), B.data(), ldb);
-
-
 
         if (info == 0) {
             success = true;
             return;
         } else {
-            std::string outputSmiles = RDKit::MolToSmiles(mol);
+            // dgesv failed (singular matrix); fall back to dgelss (pseudo-inverse via SVD).
+            // CRITICAL FIX v2.0: this is what keeps degenerate molecules such as C=C
+            // (a singular 2x2) from falling through to the {0,0,0,0,0} truncation and
+            // returning a short descriptor vector.
+            B = B_original; // Restore original RHS values
 
-            std::cerr << "dgesv failed: " << info << ", Smiles:" << outputSmiles << "\n";
+            std::vector<double> A_copy2 = A; // Fresh copy for dgelss
+            std::vector<double> B_copy = B;  // Copy B because dgelss modifies it
+
+            // Workspace for dgelss
+            std::vector<double> s(n); // Singular values
+            int rank;                 // Rank of matrix
+            double rcond = 1e-15;     // Condition number threshold
+
+            // dgelss computes the minimum-norm least-squares solution: min ||Ax - b||_2
+            info = LAPACKE_dgelss(LAPACK_COL_MAJOR, n, n, nrhs,
+                                  A_copy2.data(), lda, B_copy.data(), ldb,
+                                  s.data(), rcond, &rank);
+
+            if (info == 0) {
+                B = B_copy;
+                success = true;
+                return;
+            } else {
+                // All solvers failed - this is a true error
+                std::string outputSmiles = RDKit::MolToSmiles(mol);
+                std::cerr << "ERROR: All LAPACK solvers failed (dposv, dgesv, dgelss): info="
+                          << info << ", Smiles:" << outputSmiles << "\n";
+            }
         }
     }
 }

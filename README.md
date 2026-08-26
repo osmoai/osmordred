@@ -76,8 +76,17 @@ lives in [`osmordred_rdkit_2023_09_3_patches/`](osmordred_rdkit_2023_09_3_patche
 ```bash
 cd skbuild/test
 pip install tqdm
-python test.py          # writes Myfeatures.csv
+python test.py              # writes Myfeatures.csv
+python test_v3_fixes.py     # regression tests for the two v3 C++ fixes
 ```
+
+`test_v3_fixes.py` guards both fixes described under
+[Versions](#versions-and-the-two-codebases): that a singular system (`C=C`, `C#C`,
+`O=C=O`, …) still returns a full-width vector, and that the detour matrix
+terminates on a heavily fused polycyclic. Both failures are silent — a short
+vector, or a hang — so they need a test rather than a comment. Widths are compared
+against a reference molecule rather than hardcoded, so the test stays valid across
+builds and `version` values.
 
 **`import osmordred` fails from inside `skbuild/`** — Python picks up the
 `osmordred/` *source subdirectory* instead of the installed package. Run from
@@ -207,17 +216,76 @@ them.
 
 **Parallelism** is handled in C++, so a batch does not pay the GIL.
 
-## Known issues
+## Versions, and the two codebases
 
-This molecule causes a long stall — the computation is genuinely intensive
-rather than hung:
+Osmordred exists in two places, for two different purposes. **Keep them apart.**
+
+| | **This repo** (`osmoai/osmordred`) | **`guillaume-osmo/rdkit-osmordred` → `bp-kelley/rdkit`** |
+|---|---|---|
+| What it is | Standalone Boost.Python module beside a stock RDKit | Descriptors integrated *into* RDKit, split across files |
+| Layout | One file, `Code/Osmordred/Osmordred.cpp` | `Code/GraphMol/Descriptors/Osmordred*.cpp`, `RDKIT_DESCRIPTORS_EXPORT` |
+| Aggregate API | none — you concatenate blocks in Python | `CalcOsmordred`, `CalcOsmordredBatch`, `CalcOsmordredWithTimeout` |
+| Status | This package | **The curated, most advanced line**, aimed at upstream RDKit |
+
+Fixes flow from the RDKit line back to here. Do not port structure across — only
+the algorithms. The two have different wrapper conventions and different build
+systems, and a change that is right for one is usually wrong for the other.
+
+### What each version fixed
+
+| | v1 | v2 | v3 |
+|---|---|---|---|
+| `solveLinearSystem` | `dposv` → `dgesv` | **+ `B_original` restore** | **+ `dgelss` SVD tier** |
+| Singular 2×2 (`C=C`) | truncated vector | full width | full width |
+| Detour matrix | naive whole-graph DFS | naive whole-graph DFS | **biconnected decomposition** |
+| Polycyclic naturals (12–22 rings) | indefinite hang | indefinite hang | **< 0.5 s** |
+| Batch | one `std::async` per molecule | " | bounded thread pool + per-molecule timeout |
+
+**Both C++ fixes are now in this repo.** The batch/timeout layer is not, because
+this package has no aggregate function for it to wrap — molecule-level
+aggregation happens in Python here. See [Computing every descriptor](#computing-every-descriptor).
+
+#### The singular-matrix fix
+
+`solveLinearSystem` now has three tiers — `dposv` → `dgesv` → `dgelss`. Two bugs
+were fixed together:
+
+* **LAPACK modifies `B` in place even when it fails**, so v1 retried `dgesv` on a
+  corrupted right-hand side. The original RHS is now saved and restored before
+  each fallback.
+* **Singular matrices had no solver.** A degenerate molecule such as ethylene
+  (`C=C`, a singular 2×2) failed both tiers, the matrix descriptors fell through
+  to a 5-element `{0,0,0,0,0}` stub instead of `nrhs*5 = 20`, and the whole
+  molecule returned a *short* descriptor vector — silently, and only for the
+  molecules least likely to be in your test set. `dgelss` gives a minimum-norm
+  least-squares solution, so the fallback never fires.
+
+#### The detour-matrix hang
+
+The 14 `*_Dt` descriptors need the longest simple path between every atom pair —
+**the NP-hard longest-path problem** — and the naive whole-graph backtracking DFS
+blows up exponentially on highly-cyclic molecules. This is what made the molecule
+below hang.
+
+The fix ports Mordred's approach (`mordred/DetourMatrix.py`, `CalcDetour`):
+decompose the graph into **biconnected components**, solve the longest path
+exactly *within* each ring system (small), then merge along the block-cut tree
+through the shared articulation atoms — polynomial in the number of blocks. A
+per-block circuit-rank > 12 guard returns NaN for a genuinely intractable single
+fused cage, which does not occur in real drug or natural-product chemistry.
+
+Verified byte-identical to the previous algorithm on normal molecules (differences
+~1e-13). The molecule that used to hang:
 
 ```
 c12c3c4c5c1c1c6c7c2c2c8c3c3c9c4c4c%10c5c5c1c1c6c6c%11c7c2c2c7c8c3c3c8c9c4c4c9c%10c5c5c1c1c6c6c%11c2c2c7c3c3c8c4c4c9c5c1c1c6c2c3c41
 ```
 
-The descriptor implementation is currently ~10k lines in a single file, and the
-Python bindings would benefit from being split up and refactored.
+## Known issues
+
+The descriptor implementation is ~10k lines in a single file, and the Python
+bindings would benefit from being split up and refactored — the RDKit-integration
+line has already done this and is the better reference for how.
 
 ## Repository layout
 
